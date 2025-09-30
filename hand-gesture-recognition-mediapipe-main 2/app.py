@@ -877,7 +877,7 @@ with gr.Blocks() as demo:
         show_btn = gr.Button("Show Captured Samples", variant="primary")
         clear_btn = gr.Button("Clear Samples & Restart")
     
-    sample_gallery = gr.Gallery(label="Captured Detection Samples", columns=3, rows=2, height="auto")
+    sample_gallery = gr.Gallery(label="Captured Detection Samples", columns=3, rows=2)
     
     # Set up streaming
     webcam_input.stream(
