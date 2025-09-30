@@ -362,66 +362,71 @@
 
 
 
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
 """
-Cricket Umpire Signs Detector - Ultra Optimized for 0.5 CPU (Render)
+Cricket Umpire Signs Detector — Lean 2-Hand, Render 0.5 CPU
+- Live detection shown ONLY in the output image
+- Supports TWO hands with per-hand labels (Left / Right)
+- "Download Detected Sample" saves ONLY a detected frame (never blank)
 """
 
 import os
+# ---- Hard cap CPU threads for tiny Render instances ----
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+os.environ['OMP_NUM_THREADS'] = '1'
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
+os.environ['MKL_NUM_THREADS'] = '1'
+os.environ['VECLIB_MAXIMUM_THREADS'] = '1'
+os.environ['NUMEXPR_NUM_THREADS'] = '1'
+
 import csv
 import copy
 import itertools
-from collections import Counter, deque
+import time
+from collections import deque, defaultdict
+
 import cv2 as cv
 import numpy as np
 import mediapipe as mp
 import gradio as gr
-from model import KeyPointClassifier, PointHistoryClassifier
 
-# Disable TensorFlow warnings
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+# Keep only what we use (lighter)
+from model import KeyPointClassifier  # PointHistoryClassifier not needed here
+
+# Try to limit OpenCV threads too
+try:
+    cv.setNumThreads(1)
+except Exception:
+    pass
 
 
 class CricketUmpireDetector:
     def __init__(self):
         print("\n" + "="*60)
-        print("Initializing Cricket Umpire Signs Detector...")
+        print("Initializing Cricket Umpire Signs Detector (Lean 2-Hand)...")
         print("Optimized for low CPU environment (Render 0.5 CPU)")
         print("="*60 + "\n")
-        
+
         mp_hands = mp.solutions.hands
-        # ULTRA LOW SETTINGS for 0.5 CPU
+        # ULTRA LOW SETTINGS + two hands
         self.hands = mp_hands.Hands(
             static_image_mode=False,
-            max_num_hands=1,  # Only 1 hand for speed
-            min_detection_confidence=0.3,  # Lower for faster detection
+            max_num_hands=2,                 # TWO hands
+            min_detection_confidence=0.3,    # permissive for speed
             min_tracking_confidence=0.3,
-            model_complexity=0  # Lightest model
+            model_complexity=0               # lightest graph
         )
-        
-        try:
-            print("Loading AI models...")
-            self.keypoint_classifier = KeyPointClassifier()
-            self.point_history_classifier = PointHistoryClassifier()
-            print("✓ Models loaded successfully\n")
-        except Exception as e:
-            print(f"✗ Error loading models: {e}")
-            raise
-        
+
+        # Load tiny classifier
+        print("Loading AI model...")
+        self.keypoint_classifier = KeyPointClassifier()  # ensure num_threads=1 inside if TFLite
+        print("✓ Model loaded\n")
+
         # Load labels
         self.keypoint_classifier_labels = self._load_labels(
             'model/keypoint_classifier/keypoint_classifier_label.csv'
         )
-        self.point_history_classifier_labels = self._load_labels(
-            'model/point_history_classifier/point_history_classifier_label.csv'
-        )
-        
+
         # Map gestures to cricket umpire signals
         self.umpire_signal_mapping = {
             'Open': 'Wide',
@@ -434,34 +439,25 @@ class CricketUmpireDetector:
             'Thumbs Up': 'Free Hit',
             'Thumbs Down': 'Not Out'
         }
-        
-        # Minimal history for speed
-        self.history_length = 8  # Reduced from 16
-        self.point_history = deque(maxlen=self.history_length)
-        self.finger_gesture_history = deque(maxlen=self.history_length)
-        
-        # Captured samples storage
-        self.captured_samples = []
-        self.max_samples = 10  # Reduced from 15
+
+        # Runtime state
         self.frame_count = 0
-        self.last_detection_frame = 0
-        self.min_frames_between_capture = 45  # Capture less frequently
-        
-        # Frame skipping for CPU optimization
-        self.process_every_n_frames = 3  # Process every 3rd frame
+        self.process_every_n_frames = 4     # start processing every 4th frame
         self.last_processed_image = None
-        self.last_status = "Initializing..."
-        
-        # Detection state
-        self.current_detection = None
-        self.detection_confidence_threshold = 2  # Reduced from 3
-        self.consistent_detection_count = 0
-        
-        print("✓ Detector initialized successfully!")
-        print(f"✓ Frame skip rate: 1/{self.process_every_n_frames} (for CPU efficiency)")
-        print(f"✓ Max samples: {self.max_samples}")
+
+        # Per-hand smoothing buffer (Left/Right)
+        self.smoother = defaultdict(lambda: deque(maxlen=4))
+
+        # Keep last detected RGB frame for download
+        self.last_detected_rgb = None
+        self.detected_in_last_frame = False
+
+        # Precompute fingertip indices
+        self.fingertips = (4, 8, 12, 16, 20)
+
+        print(f"✓ Frame skip rate: 1/{self.process_every_n_frames} (adaptive)")
         print("="*60 + "\n")
-    
+
     def _load_labels(self, filepath):
         try:
             with open(filepath, encoding='utf-8-sig') as f:
@@ -472,207 +468,134 @@ class CricketUmpireDetector:
         except Exception as e:
             print(f"  Error loading labels from {filepath}: {e}")
             return ["Unknown"]
-    
+
     def _get_umpire_signal(self, gesture_name):
-        """Map gesture to cricket umpire signal"""
         return self.umpire_signal_mapping.get(gesture_name, gesture_name)
-    
+
+    # ---------- Core processing ----------
     def process_frame(self, image):
+        """Return only the processed/detected output image (no status text separately)."""
         if image is None:
-            print("⚠ No image received")
-            return None, "⚠ No camera input"
-        
+            return None  # Gradio will keep last frame
+
         self.frame_count += 1
-        
-        # FRAME SKIPPING for CPU efficiency
+
+        # Skip frames for CPU efficiency — return last processed if exists
         if self.frame_count % self.process_every_n_frames != 0:
-            # Return last processed frame
-            if self.last_processed_image is not None:
-                return self.last_processed_image, self.last_status
-            # First few frames - return passthrough
-            try:
-                passthrough = cv.cvtColor(image, cv.COLOR_RGB2BGR) if len(image.shape) == 3 else image
-                passthrough = cv.flip(passthrough, 1)
-                passthrough_rgb = cv.cvtColor(passthrough, cv.COLOR_BGR2RGB)
-                return passthrough_rgb, "⏳ Warming up..."
-            except:
-                return image, "⏳ Warming up..."
-        
-        try:
-            # Resize to 50% for faster processing on low CPU
-            h, w = image.shape[:2]
-            scale = 0.5  # 50% resolution
-            small_h, small_w = int(h * scale), int(w * scale)
-            image_small = cv.resize(image, (small_w, small_h))
-            
-            # Convert image properly
-            if len(image_small.shape) == 3 and image_small.shape[2] == 3:
-                image_bgr = cv.cvtColor(image_small, cv.COLOR_RGB2BGR)
-            else:
-                image_bgr = image_small
-            
-            # Flip for mirror effect
-            image_bgr = cv.flip(image_bgr, 1)
-            debug_image = image_bgr.copy()  # Shallow copy for speed
-            
-            # Process with MediaPipe
-            image_rgb = cv.cvtColor(image_bgr, cv.COLOR_BGR2RGB)
-            image_rgb.flags.writeable = False
-            results = self.hands.process(image_rgb)
-            image_rgb.flags.writeable = True
-            
-            status_message = "👋 Show umpire signal..."
-            detected_signal = None
-            
-            if results.multi_hand_landmarks is not None:
-                # Only process first hand
-                hand_landmarks = results.multi_hand_landmarks[0]
-                handedness = results.multi_handedness[0]
-                
-                # Calculate landmarks
-                landmark_list = self._calc_landmark_list(debug_image, hand_landmarks)
-                
-                # Classify gesture
-                preprocessed_landmarks = self._preprocess_landmark(landmark_list)
-                hand_sign_id = self.keypoint_classifier(preprocessed_landmarks)
-                
-                # Skip point history tracking for speed on low CPU
-                # Just use the hand sign
-                
-                # Get gesture name and umpire signal
-                gesture_name = self.keypoint_classifier_labels[hand_sign_id]
+            return self.last_processed_image if self.last_processed_image is not None else image
+
+        t0 = time.time()
+
+        # Downscale aggressively for MediaPipe speed (320x240 target)
+        ih, iw = image.shape[:2]
+        if ih * iw > 320 * 240:
+            image_small = cv.resize(image, (320, 240), interpolation=cv.INTER_AREA)
+        else:
+            image_small = image
+
+        # Convert & mirror
+        bgr = cv.cvtColor(image_small, cv.COLOR_RGB2BGR)
+        bgr = cv.flip(bgr, 1)
+
+        # MediaPipe expects RGB
+        rgb = cv.cvtColor(bgr, cv.COLOR_BGR2RGB)
+        rgb.flags.writeable = False
+        results = self.hands.process(rgb)
+        rgb.flags.writeable = True
+
+        overlay = bgr  # draw on this
+        header_text_parts = []
+        detected_any = False
+
+        if results.multi_hand_landmarks:
+            # iterate each detected hand, aligned with handedness
+            for i, hand_landmarks in enumerate(results.multi_hand_landmarks):
+                hand_label = "Hand"
+                if results.multi_handedness and i < len(results.multi_handedness):
+                    hand_label = results.multi_handedness[i].classification[0].label  # 'Left'/'Right'
+
+                landmark_list = self._calc_landmark_list(overlay, hand_landmarks)
+                pre = self._preprocess_landmark(landmark_list)
+                hand_sign_id = self.keypoint_classifier(pre)
+                gesture_name = self.keypoint_classifier_labels[hand_sign_id] if hand_sign_id < len(self.keypoint_classifier_labels) else "Unknown"
                 umpire_signal = self._get_umpire_signal(gesture_name)
-                hand_type = handedness.classification[0].label
-                
-                # Simple drawing (minimal for speed)
-                debug_image = self._draw_simple(debug_image, landmark_list, umpire_signal, hand_type)
-                
-                detected_signal = umpire_signal
-                status_message = f"✓ {umpire_signal} ({hand_type})"
-                
-                # Track consistent detection
-                if detected_signal == self.current_detection:
-                    self.consistent_detection_count += 1
-                else:
-                    self.current_detection = detected_signal
-                    self.consistent_detection_count = 1
-                
-                # Capture sample if consistent
-                frames_since_last = self.frame_count - self.last_detection_frame
-                if (self.consistent_detection_count >= self.detection_confidence_threshold and
-                    frames_since_last >= self.min_frames_between_capture and
-                    len(self.captured_samples) < self.max_samples and
-                    detected_signal != "Unknown"):
-                    
-                    self._capture_sample(debug_image, umpire_signal, gesture_name, hand_type)
-                    self.last_detection_frame = self.frame_count
-                    status_message += " 💾[SAVED]"
-                    print(f"📸 Captured: {umpire_signal} (Sample #{len(self.captured_samples)})")
-            else:
-                self.current_detection = None
-                self.consistent_detection_count = 0
-            
-            # Add simple header
-            debug_image = self._draw_simple_header(debug_image, status_message)
-            
-            # Convert back to RGB for Gradio
-            output_image = cv.cvtColor(debug_image, cv.COLOR_BGR2RGB)
-            
-            # Cache this result
-            self.last_processed_image = output_image
-            self.last_status = status_message
-            
-            # Print every 30 frames
-            if self.frame_count % 30 == 0:
-                print(f"🎬 Frame {self.frame_count} | Samples: {len(self.captured_samples)}/{self.max_samples}")
-            
-            return output_image, status_message
-            
-        except Exception as e:
-            error_msg = f"❌ Error: {str(e)}"
-            print(f"\n{error_msg}")
-            import traceback
-            traceback.print_exc()
-            # Return passthrough on error
-            try:
-                passthrough = cv.cvtColor(image, cv.COLOR_RGB2BGR) if len(image.shape) == 3 else image
-                passthrough = cv.flip(passthrough, 1)
-                passthrough_rgb = cv.cvtColor(passthrough, cv.COLOR_BGR2RGB)
-                return passthrough_rgb, error_msg
-            except:
-                return image, error_msg
-    
-    def _capture_sample(self, image, signal, gesture, hand_type):
-        """Capture a detected umpire signal sample"""
-        sample_rgb = cv.cvtColor(image.copy(), cv.COLOR_BGR2RGB)
-        self.captured_samples.append({
-            'image': sample_rgb,
-            'signal': signal,
-            'gesture': gesture,
-            'hand': hand_type,
-            'frame': self.frame_count
-        })
-    
-    def get_captured_samples(self):
-        """Return captured samples for gallery display"""
-        print(f"\n📊 Showing {len(self.captured_samples)} captured samples")
-        if len(self.captured_samples) == 0:
-            return []
-        return [
-            (sample['image'], f"🏏 {sample['signal']}\n({sample['hand']} hand)")
-            for sample in self.captured_samples
-        ]
-    
-    def clear_samples(self):
-        """Clear all captured samples"""
-        count = len(self.captured_samples)
-        self.captured_samples = []
-        self.frame_count = 0
-        self.last_detection_frame = 0
-        self.current_detection = None
-        self.consistent_detection_count = 0
-        print(f"\n🗑️ Cleared {count} samples")
-        return count
-    
+
+                # Smooth per hand (Left/Right streams)
+                self.smoother[hand_label].append(umpire_signal)
+                # Most frequent in recent buffer
+                smoothed = max(set(self.smoother[hand_label]), key=self.smoother[hand_label].count)
+
+                # Minimal drawing: fingertips + wrist dot + tiny per-hand label
+                self._draw_minimal(overlay, landmark_list)
+                self._put_label_near_wrist(overlay, landmark_list, f"{hand_label}: {smoothed}")
+
+                header_text_parts.append(f"{hand_label}: {smoothed}")
+                if smoothed and smoothed != "Unknown":
+                    detected_any = True
+        else:
+            header_text_parts.append("Show signals")
+
+        # Small header bar summarizing both hands
+        self._draw_header(overlay, " | ".join(header_text_parts))
+
+        # Back to RGB for Gradio
+        output_image = cv.cvtColor(overlay, cv.COLOR_BGR2RGB)
+        self.last_processed_image = output_image
+
+        # Store detected frame only if a real signal exists
+        self.detected_in_last_frame = detected_any
+        if detected_any:
+            self.last_detected_rgb = output_image.copy()
+
+        # Adaptive throttle (aim to keep under ~80–100ms per processed frame)
+        dt = time.time() - t0
+        if dt > 0.08 and self.process_every_n_frames < 6:
+            self.process_every_n_frames += 1  # skip more
+        elif dt < 0.04 and self.process_every_n_frames > 3:
+            self.process_every_n_frames -= 1  # process a bit more often
+
+        return output_image
+
+    # ---------- Drawing / helpers ----------
     def _calc_landmark_list(self, image, landmarks):
         h, w = image.shape[:2]
-        return [[min(int(lm.x * w), w-1), min(int(lm.y * h), h-1)] 
+        return [[min(int(lm.x * w), w-1), min(int(lm.y * h), h-1)]
                 for lm in landmarks.landmark]
-    
+
     def _preprocess_landmark(self, landmark_list):
-        temp_list = copy.deepcopy(landmark_list)
-        base_x, base_y = temp_list[0]
-        temp_list = [[x - base_x, y - base_y] for x, y in temp_list]
-        temp_list = list(itertools.chain.from_iterable(temp_list))
-        max_value = max(map(abs, temp_list)) or 1
-        return [v / max_value for v in temp_list]
-    
-    def _draw_simple(self, image, landmarks, signal, hand_type):
-        """Ultra-simple drawing for speed"""
-        if len(landmarks) == 0:
-            return image
-        
-        # Draw only fingertips (5 points instead of 21)
-        for i in [4, 8, 12, 16, 20]:
+        temp = copy.deepcopy(landmark_list)
+        base_x, base_y = temp[0]
+        temp = [[x - base_x, y - base_y] for x, y in temp]
+        temp = list(itertools.chain.from_iterable(temp))
+        max_value = max(map(abs, temp)) or 1
+        return [v / max_value for v in temp]
+
+    def _draw_minimal(self, image, landmarks):
+        # fingertips + wrist only (6 tiny dots)
+        for i in self.fingertips:
             cv.circle(image, tuple(landmarks[i]), 3, (0, 255, 0), -1)
-        
-        # Draw palm base
         cv.circle(image, tuple(landmarks[0]), 4, (255, 0, 0), -1)
-        
-        return image
-    
-    def _draw_simple_header(self, image, status):
-        """Minimal header"""
+
+    def _put_label_near_wrist(self, image, landmarks, text):
+        x, y = landmarks[0]
+        y = max(y - 10, 10)
+        cv.putText(image, text, (x, y), cv.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv.LINE_AA)
+
+    def _draw_header(self, image, status):
         h, w = image.shape[:2]
-        
-        # Small header bar
-        cv.rectangle(image, (0, 0), (w, 35), (40, 40, 40), -1)
-        
-        # Status text
-        cv.putText(image, status, (5, 22),
-                  cv.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv.LINE_AA)
-        
-        return image
+        cv.rectangle(image, (0, 0), (w, 28), (40, 40, 40), -1)
+        cv.putText(image, status, (6, 19), cv.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1, cv.LINE_AA)
+
+    # ---------- Download helper ----------
+    def save_detected_sample(self):
+        """Save and return a path ONLY if we have a detected frame."""
+        if not self.detected_in_last_frame or self.last_detected_rgb is None:
+            return None
+        ts = int(time.time())
+        path = f"/tmp/umpire_detected_{ts}.png"
+        bgr = cv.cvtColor(self.last_detected_rgb, cv.COLOR_RGB2BGR)
+        cv.imwrite(path, bgr)
+        return path
 
 
 # Global detector instance
@@ -687,138 +610,80 @@ def initialize_detector():
 
 
 def process_video_frame(image):
-    global detector
+    """
+    Live stream handler: returns ONLY the processed image (detected output).
+    """
     try:
         if detector is None:
-            print("\n🚀 Initializing detector...")
-            detector = initialize_detector()
-        
-        if image is None:
-            return None, "⏳ Waiting for camera..."
-        
-        result = detector.process_frame(image)
-        return result
-        
+            initialize_detector()
+        return detector.process_frame(image)
     except Exception as e:
         print(f"\n❌ ERROR in process_video_frame: {e}")
-        import traceback
-        traceback.print_exc()
-        # Return passthrough on error
-        try:
-            return image, f"Error: {str(e)}"
-        except:
-            return None, f"Error: {str(e)}"
+        return image  # fall back to passthrough if error
 
 
-def show_captured_samples():
-    global detector
+def download_detected_sample():
+    """
+    Gradio download handler: returns a file path only when a detection exists.
+    """
     if detector is None:
-        print("⚠ Detector not initialized")
-        return []
-    return detector.get_captured_samples()
-
-
-def clear_samples():
-    global detector
-    if detector is not None:
-        count = detector.clear_samples()
-        return [], f"✓ Cleared {count} samples!"
-    return [], "No samples to clear"
+        return None
+    return detector.save_detected_sample()
 
 
 def create_interface():
-    with gr.Blocks(title="🏏 Cricket Umpire Signs Detector", theme=gr.themes.Soft()) as demo:
-        gr.Markdown("""
-        # 🏏 Cricket Umpire Signs Detector
-        ### Real-time detection of cricket umpire hand signals
-        **Optimized for Render (0.5 CPU) - Processing every 3rd frame**
-        """)
-        
+    with gr.Blocks(title="🏏 Cricket Umpire Signs — Lean 2-Hand", theme=gr.themes.Soft()) as demo:
+        gr.Markdown("# 🏏 Cricket Umpire Signs — Lean (Two Hands)\nLive output only. Download saves a detected sample frame.")
+
         with gr.Row():
             with gr.Column(scale=1):
                 webcam_input = gr.Image(
                     sources=["webcam"],
                     streaming=True,
-                    label="📹 Camera Feed",
+                    label="📹 Camera",
                     type="numpy",
                     mirror_webcam=False
                 )
-                
-                with gr.Row():
-                    show_samples_btn = gr.Button("📊 Show Captured Samples", variant="primary", size="sm")
-                    clear_samples_btn = gr.Button("🗑️ Clear Samples", variant="stop", size="sm")
-            
             with gr.Column(scale=1):
                 output_display = gr.Image(
                     label="🎯 Live Detection Output",
                     type="numpy"
                 )
-                status_box = gr.Textbox(
-                    label="Detection Status",
-                    value="Ready - Show umpire signals to camera",
-                    interactive=False,
-                    lines=2
-                )
-                
-                gr.Markdown("""
-                ### 🏏 Detectable Signals:
-                - **Wide** (Open hand) | **Out** (Closed fist)
-                - **No Ball** (Pointer) | **Four** (OK sign)
-                - **Six** (Peace sign) | And more...
-                
-                *Frames auto-saved when signals detected!*
-                """)
-        
-        sample_gallery = gr.Gallery(
-            label="📸 Captured Umpire Signals",
-            columns=3,
-            rows=2,
-            height="auto"
-        )
-        
-        # Stream processing
+
+        # Live streaming: ONLY the image output (no status textbox)
         webcam_input.stream(
             fn=process_video_frame,
             inputs=webcam_input,
-            outputs=[output_display, status_box],
+            outputs=output_display,
             show_progress="hidden"
         )
-        
-        # Button actions
-        show_samples_btn.click(
-            fn=show_captured_samples,
-            outputs=sample_gallery
-        )
-        
-        clear_samples_btn.click(
-            fn=clear_samples,
-            outputs=[sample_gallery, status_box]
-        )
-    
+
+        # Download button — returns file ONLY when a detection exists
+        download_btn = gr.DownloadButton("📥 Download Detected Sample", file_name="umpire_detected.png")
+        download_btn.click(fn=download_detected_sample, outputs=download_btn)
+
     return demo
 
 
 if __name__ == "__main__":
     print("\n" + "="*60)
-    print("🏏 CRICKET UMPIRE SIGNS DETECTOR")
+    print("🏏 CRICKET UMPIRE SIGNS DETECTOR — Lean 2-Hand")
     print("Optimized for Render.com (0.5 CPU)")
     print("="*60 + "\n")
-    
-    # Initialize detector on startup
-    print("Pre-initializing detector...")
+
+    # Initialize detector on startup (warms up graphs)
     initialize_detector()
-    
-    # Get port from environment
+
     port = int(os.environ.get("PORT", 10000))
     print(f"\n🌐 Starting server on port {port}...")
-    
-    # Create and launch interface
+
     demo = create_interface()
+    # Tiny queue + single concurrency to avoid CPU bursts
     demo.queue(
-        max_size=5,  # Reduced queue for low CPU
-        default_concurrency_limit=2
+        max_size=2,
+        default_concurrency_limit=1
     )
-    
+
     print("\n🚀 Launching Gradio interface...")
     demo.launch(
         server_name="0.0.0.0",
@@ -826,6 +691,7 @@ if __name__ == "__main__":
         share=False,
         show_error=True
     )
-    
+
     print("\n✓ Server running!")
     print("="*60)
+
