@@ -2,7 +2,7 @@
 opencv-python==4.10.0.84
 mediapipe==0.10.14
 numpy==1.26.4
-gradio==4.44.0
+gradio==4.44.1
 
 # Machine Learning
 tensorflow==2.16.1
