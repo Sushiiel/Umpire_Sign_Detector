@@ -890,6 +890,9 @@ with gr.Blocks() as demo:
     show_btn.click(fn=show_samples, outputs=sample_gallery)
     clear_btn.click(fn=clear_and_restart, outputs=sample_gallery)
 
-
 if __name__ == "__main__":
-    demo.launch(share=False)
+    demo.launch(
+        server_name="0.0.0.0",
+        server_port=10000,
+        share=False
+    )
