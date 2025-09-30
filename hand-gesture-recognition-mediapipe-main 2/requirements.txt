@@ -1,3 +1,5 @@
+# requirements.txt
+tensorflow-cpu==2.16.2
 streamlit==1.38.0
 streamlit-webrtc==0.47.7
 opencv-python-headless==4.10.0.84
