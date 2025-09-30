@@ -724,11 +724,10 @@ import cv2 as cv
 import numpy as np
 import mediapipe as mp
 import streamlit as st
-from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, WebRtcMode
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, WebRtcMode
 
 # import your classifier (ensure it uses 1 thread if TFLite)
 from model import KeyPointClassifier  # keep your existing module/folder
-
 
 # Try to keep OpenCV single-threaded
 try:
@@ -806,7 +805,7 @@ class LeanUmpireDetector:
         Returns (output_rgb, detected_any)
         - frame skipping, 320x240 resize, minimal draw
         """
-        # Skip logic handled by transformer; here we just process
+        # Downscale for CPU
         img = frame_rgb
         ih, iw = img.shape[:2]
         if ih * iw > 320 * 240:
@@ -854,8 +853,8 @@ class LeanUmpireDetector:
         return out_rgb, detected
 
 
-# -------------------- Video Transformer --------------------
-class Transformer(VideoTransformerBase):
+# -------------------- Video Processor --------------------
+class Processor(VideoProcessorBase):
     def __init__(self):
         self.detector = LeanUmpireDetector()
         self.smoother = defaultdict(lambda: deque(maxlen=4))
@@ -868,7 +867,7 @@ class Transformer(VideoTransformerBase):
         self.frame_i += 1
         img = frame.to_ndarray(format="rgb24")
 
-        # Frame skipping for CPU: return cached when skipping
+        # Frame skipping for CPU
         if self.frame_i % self.process_every != 0 and self.last_output is not None:
             return av.VideoFrame.from_ndarray(self.last_output, format="rgb24")
 
@@ -894,9 +893,9 @@ st.set_page_config(page_title="🏏 Umpire Signs — Streamlit (Lean 2-Hand)", l
 st.title("🏏 Cricket Umpire Signs — Streamlit (Two Hands, 0.5 CPU)")
 st.caption("Live detected output only. Download returns a detected sample frame (never blank).")
 
-# Create/hold a transformer in session state so we can access last_detected
-if "transformer" not in st.session_state:
-    st.session_state.transformer = Transformer()
+# Initialize processor in session state
+if "processor" not in st.session_state:
+    st.session_state["processor"] = Processor()
 
 col1, col2 = st.columns([1, 1])
 with col1:
@@ -907,7 +906,7 @@ with col2:
 webrtc_ctx = webrtc_streamer(
     key="umpire-two-hand",
     mode=WebRtcMode.SENDRECV,
-    video_transformer_factory=lambda: st.session_state.transformer,
+    video_processor_factory=Processor,   # ✅ new API
     media_stream_constraints={"video": True, "audio": False},
     async_processing=True,
 )
@@ -915,9 +914,9 @@ webrtc_ctx = webrtc_streamer(
 st.divider()
 
 # Download detected sample only
-detected_img = st.session_state.transformer.last_detected
+processor: Processor = st.session_state["processor"]
+detected_img = processor.last_detected
 if detected_img is not None:
-    # encode as PNG in-memory
     success, buf = cv.imencode(".png", cv.cvtColor(detected_img, cv.COLOR_RGB2BGR))
     if success:
         st.download_button(
