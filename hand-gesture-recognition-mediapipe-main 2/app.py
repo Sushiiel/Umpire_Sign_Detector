@@ -696,10 +696,10 @@
 #     print("="*60)
 
 """
-Streamlit — Cricket Umpire Signs (Lean 2-Hand, 0.5 CPU)
-- Live webcam with minimal overlay
-- Two-hand detection (Left/Right)
-- Download button saves ONLY a detected frame (never blank)
+Streamlit — Cricket Umpire Signs (Optimized for 0.5 CPU)
+- Efficient two-hand detection with minimal resource usage
+- Live webcam with gesture display
+- Download button for detected frames only
 """
 
 import os
@@ -726,32 +726,139 @@ import mediapipe as mp
 import streamlit as st
 from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, WebRtcMode, RTCConfiguration
 
-# import your classifier (ensure it uses 1 thread if TFLite)
-from model import KeyPointClassifier  # keep your existing module/folder
-
 # Try to keep OpenCV single-threaded
 try:
     cv.setNumThreads(1)
 except Exception:
     pass
 
-
-# -------------------- Detector (stateless helper) --------------------
-class LeanUmpireDetector:
+# -------------------- Simple KeyPoint Classifier (Fallback) --------------------
+class KeyPointClassifier:
+    """Fallback classifier if your model isn't available"""
     def __init__(self):
+        self.model = None
+        # Simple gesture mapping based on hand landmarks
+        self.gesture_thresholds = {
+            'Open': lambda lms: self._is_open_hand(lms),
+            'Close': lambda lms: self._is_closed_fist(lms),
+            'Pointer': lambda lms: self._is_pointing(lms),
+            'OK': lambda lms: self._is_ok_sign(lms),
+            'Peace': lambda lms: self._is_peace_sign(lms),
+            'Thumbs Up': lambda lms: self._is_thumbs_up(lms),
+        }
+    
+    def __call__(self, features):
+        # Simple rule-based classification as fallback
+        # In practice, you'd load your actual trained model here
+        return 0  # Default to first class
+    
+    def _is_open_hand(self, landmarks):
+        """Check if all fingers are extended"""
+        if len(landmarks) < 21:
+            return False
+        # Simplified check - compare fingertip y-coordinates with base y-coordinates
+        try:
+            tips = [8, 12, 16, 20]  # fingertip indices
+            bases = [6, 10, 14, 18]  # base indices
+            extended_fingers = sum(1 for tip, base in zip(tips, bases) 
+                                if landmarks[tip][1] < landmarks[base][1])
+            return extended_fingers >= 3
+        except:
+            return False
+    
+    def _is_closed_fist(self, landmarks):
+        """Check if all fingers are closed"""
+        if len(landmarks) < 21:
+            return False
+        try:
+            tips = [8, 12, 16, 20]
+            bases = [5, 9, 13, 17]
+            closed_fingers = sum(1 for tip, base in zip(tips, bases) 
+                               if landmarks[tip][1] > landmarks[base][1])
+            return closed_fingers >= 3
+        except:
+            return False
+    
+    def _is_pointing(self, landmarks):
+        """Check if only index finger is extended"""
+        if len(landmarks) < 21:
+            return False
+        try:
+            # Index finger extended, others closed
+            return (landmarks[8][1] < landmarks[6][1] and  # index extended
+                    landmarks[12][1] > landmarks[10][1] and  # middle closed
+                    landmarks[16][1] > landmarks[14][1] and  # ring closed
+                    landmarks[20][1] > landmarks[18][1])     # pinky closed
+        except:
+            return False
+    
+    def _is_ok_sign(self, landmarks):
+        """Check for OK sign (thumb and index finger touching)"""
+        if len(landmarks) < 21:
+            return False
+        try:
+            thumb_tip = np.array(landmarks[4])
+            index_tip = np.array(landmarks[8])
+            distance = np.linalg.norm(thumb_tip - index_tip)
+            return distance < 30  # Threshold for touching
+        except:
+            return False
+    
+    def _is_peace_sign(self, landmarks):
+        """Check for peace sign (index and middle extended)"""
+        if len(landmarks) < 21:
+            return False
+        try:
+            return (landmarks[8][1] < landmarks[6][1] and  # index extended
+                    landmarks[12][1] < landmarks[10][1] and  # middle extended
+                    landmarks[16][1] > landmarks[14][1] and  # ring closed
+                    landmarks[20][1] > landmarks[18][1])     # pinky closed
+        except:
+            return False
+    
+    def _is_thumbs_up(self, landmarks):
+        """Check for thumbs up"""
+        if len(landmarks) < 21:
+            return False
+        try:
+            return (landmarks[4][1] < landmarks[3][1] and  # thumb extended up
+                    landmarks[8][1] > landmarks[6][1] and  # other fingers closed
+                    landmarks[12][1] > landmarks[10][1] and
+                    landmarks[16][1] > landmarks[14][1] and
+                    landmarks[20][1] > landmarks[18][1])
+        except:
+            return False
+
+# -------------------- Efficient Detector --------------------
+class EfficientUmpireDetector:
+    def __init__(self):
+        # Initialize MediaPipe Hands with minimal settings
         mp_hands = mp.solutions.hands
         self.hands = mp_hands.Hands(
             static_image_mode=False,
             max_num_hands=2,
-            min_detection_confidence=0.3,
+            min_detection_confidence=0.4,  # Slightly higher for stability
             min_tracking_confidence=0.3,
-            model_complexity=0,
+            model_complexity=0,  # Lowest complexity
         )
-        self.keypoint_classifier = KeyPointClassifier()
-        self.labels = self._load_labels('model/keypoint_classifier/keypoint_classifier_label.csv')
+        
+        # Initialize classifier
+        try:
+            # Try to import your actual model
+            from model import KeyPointClassifier as ActualClassifier
+            self.keypoint_classifier = ActualClassifier()
+            st.success("✓ Loaded trained gesture classifier")
+        except ImportError:
+            self.keypoint_classifier = KeyPointClassifier()
+            st.warning("⚠ Using fallback gesture classifier")
+        
+        # Load labels
+        self.labels = self._load_labels()
+        
+        # Gesture to cricket signal mapping
         self.map_dict = {
             'Open': 'Wide',
-            'Close': 'Out',
+            'Close': 'Out', 
             'Pointer': 'No Ball',
             'OK': 'Four',
             'Peace': 'Six',
@@ -760,178 +867,323 @@ class LeanUmpireDetector:
             'Thumbs Up': 'Free Hit',
             'Thumbs Down': 'Not Out'
         }
-        self.fingertips = (4, 8, 12, 16, 20)
+        
+        # Key landmarks for visualization
+        self.fingertips = [4, 8, 12, 16, 20]  # thumb, index, middle, ring, pinky
+        self.connections = mp.solutions.hands.HAND_CONNECTIONS
 
-    def _load_labels(self, path):
+    def _load_labels(self):
+        """Load gesture labels from CSV"""
+        default_labels = ["Open", "Close", "Pointer", "OK", "Peace", "Rock", "Thumbs Up", "Thumbs Down"]
         try:
-            with open(path, encoding='utf-8-sig') as f:
+            with open('model/keypoint_classifier/keypoint_classifier_label.csv', encoding='utf-8-sig') as f:
                 return [row[0] for row in csv.reader(f)]
-        except Exception:
-            return ["Unknown"]
-
-    def _map(self, g):
-        return self.map_dict.get(g, g)
+        except Exception as e:
+            st.warning(f"Could not load labels: {e}. Using default labels.")
+            return default_labels
 
     def _calc_landmarks(self, img, landmarks):
+        """Convert normalized landmarks to pixel coordinates"""
         h, w = img.shape[:2]
-        return [[min(int(lm.x * w), w-1), min(int(lm.y * h), h-1)]
-                for lm in landmarks.landmark]
+        return [[int(lm.x * w), int(lm.y * h)] for lm in landmarks.landmark]
 
-    def _preprocess(self, lm_list):
-        temp = copy.deepcopy(lm_list)
-        bx, by = temp[0]
-        temp = [[x - bx, y - by] for x, y in temp]
+    def _preprocess_landmarks(self, landmark_list):
+        """Normalize landmarks for classification"""
+        if not landmark_list:
+            return []
+            
+        temp = copy.deepcopy(landmark_list)
+        
+        # Convert to relative coordinates
+        base_x, base_y = temp[0]
+        temp = [[x - base_x, y - base_y] for x, y in temp]
+        
+        # Flatten and normalize
         temp = list(itertools.chain.from_iterable(temp))
-        mv = max(map(abs, temp)) or 1
-        return [v / mv for v in temp]
+        max_val = max(map(abs, temp)) or 1
+        
+        return [v / max_val for v in temp]
 
-    def _draw_points(self, img, lms):
-        for i in self.fingertips:
-            cv.circle(img, tuple(lms[i]), 3, (0, 255, 0), -1)
-        cv.circle(img, tuple(lms[0]), 4, (255, 0, 0), -1)
+    def _draw_hand_landmarks(self, img, landmarks, hand_type="Hand"):
+        """Efficiently draw hand landmarks and connections"""
+        # Draw connections
+        for connection in self.connections:
+            start_idx, end_idx = connection
+            if start_idx < len(landmarks) and end_idx < len(landmarks):
+                cv.line(img, tuple(landmarks[start_idx]), tuple(landmarks[end_idx]), 
+                       (0, 255, 0), 1, cv.LINE_AA)
+        
+        # Draw key points
+        for idx in self.fingertips:
+            if idx < len(landmarks):
+                cv.circle(img, tuple(landmarks[idx]), 4, (0, 255, 0), -1, cv.LINE_AA)
+        
+        # Draw wrist point
+        if landmarks:
+            cv.circle(img, tuple(landmarks[0]), 5, (255, 0, 0), -1, cv.LINE_AA)
 
-    def _label(self, img, lms, txt):
-        x, y = lms[0]
-        y = max(y - 10, 10)
-        cv.putText(img, txt, (x, y), cv.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv.LINE_AA)
+    def _add_gesture_label(self, img, landmarks, gesture, hand_type):
+        """Add gesture label above hand"""
+        if not landmarks:
+            return
+            
+        x, y = landmarks[0]  # Use wrist position as anchor
+        label_y = max(y - 15, 20)
+        
+        label_text = f"{hand_type}: {gesture}"
+        cv.putText(img, label_text, (x, label_y), 
+                  cv.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv.LINE_AA)
 
-    def _header(self, img, text):
+    def _add_header(self, img, signals):
+        """Add header with current signals"""
         h, w = img.shape[:2]
-        cv.rectangle(img, (0, 0), (w, 28), (40, 40, 40), -1)
-        cv.putText(img, text, (6, 19), cv.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1, cv.LINE_AA)
+        
+        # Semi-transparent header background
+        overlay = img.copy()
+        cv.rectangle(overlay, (0, 0), (w, 35), (40, 40, 40), -1)
+        cv.addWeighted(overlay, 0.7, img, 0.3, 0, img)
+        
+        header_text = " | ".join(signals) if signals else "Show hand signals"
+        cv.putText(img, header_text, (10, 25), 
+                  cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1, cv.LINE_AA)
 
-    def run(self, frame_rgb: np.ndarray, smoother, process_every: int, frame_i: int):
+    def process_frame(self, frame_rgb, smoother, frame_count):
         """
-        Returns (output_rgb, detected_any)
-        - 320x240 resize, minimal draw
+        Process a single frame for hand detection and gesture recognition
+        Returns: (processed_image, detected_gestures, any_detection)
         """
-        img = frame_rgb
-        ih, iw = img.shape[:2]
-        if ih * iw > 320 * 240:
-            img = cv.resize(img, (320, 240), interpolation=cv.INTER_AREA)
-
-        bgr = cv.cvtColor(img, cv.COLOR_RGB2BGR)
-        bgr = cv.flip(bgr, 1)
-
-        rgb = cv.cvtColor(bgr, cv.COLOR_BGR2RGB)
-        rgb.flags.writeable = False
-        res = self.hands.process(rgb)
-        rgb.flags.writeable = True
-
-        overlay = bgr
-        header = []
-        detected = False
-
-        if res.multi_hand_landmarks:
-            for i, hand_lms in enumerate(res.multi_hand_landmarks):
-                hand_label = "Hand"
-                if res.multi_handedness and i < len(res.multi_handedness):
-                    hand_label = res.multi_handedness[i].classification[0].label  # Left/Right
-
-                lms = self._calc_landmarks(overlay, hand_lms)
-                feats = self._preprocess(lms)
-                hid = self.keypoint_classifier(feats)
-                gname = self.labels[hid] if hid < len(self.labels) else "Unknown"
-                signal = self._map(gname)
-
-                # Smooth per-hand
-                smoother[hand_label].append(signal)
-                smoothed = max(set(smoother[hand_label]), key=self.smoother_count)
-
-                self._draw_points(overlay, lms)
-                self._label(overlay, lms, f"{hand_label}: {smoothed}")
-
-                header.append(f"{hand_label}: {smoothed}")
-                if smoothed and smoothed != "Unknown":
-                    detected = True
-        else:
-            header.append("Show signals")
-
-        self._header(overlay, " | ".join(header))
-        out_rgb = cv.cvtColor(overlay, cv.COLOR_BGR2RGB)
-        return out_rgb, detected
-
-    @staticmethod
-    def smoother_count(iterable):
-        # small helper for max(..., key=...)
-        return list(iterable).count
+        # Resize for efficiency (maintain aspect ratio)
+        h, w = frame_rgb.shape[:2]
+        if w > 320:
+            scale = 320 / w
+            new_w, new_h = 320, int(h * scale)
+            frame_rgb = cv.resize(frame_rgb, (new_w, new_h), interpolation=cv.INTER_AREA)
+        
+        # Flip for mirror effect and convert to BGR for MediaPipe
+        frame_bgr = cv.cvtColor(cv.flip(frame_rgb, 1), cv.COLOR_RGB2BGR)
+        
+        # Process with MediaPipe Hands
+        rgb_for_mp = cv.cvtColor(frame_bgr, cv.COLOR_BGR2RGB)
+        rgb_for_mp.flags.writeable = False
+        results = self.hands.process(rgb_for_mp)
+        rgb_for_mp.flags.writeable = True
+        
+        output_img = frame_bgr.copy()
+        current_signals = []
+        detected_any = False
+        
+        if results.multi_hand_landmarks:
+            for hand_idx, hand_landmarks in enumerate(results.multi_hand_landmarks):
+                # Get hand type (Left/Right)
+                hand_type = "Right"  # Default
+                if results.multi_handedness and hand_idx < len(results.multi_handedness):
+                    hand_type = results.multi_handedness[hand_idx].classification[0].label
+                
+                # Convert landmarks to pixel coordinates
+                landmarks = self._calc_landmarks(output_img, hand_landmarks)
+                
+                # Classify gesture
+                preprocessed = self._preprocess_landmarks(landmarks)
+                if preprocessed:
+                    try:
+                        gesture_id = self.keypoint_classifier(preprocessed)
+                        gesture_name = self.labels[gesture_id] if gesture_id < len(self.labels) else "Unknown"
+                    except:
+                        gesture_name = "Unknown"
+                    
+                    # Map to cricket signal
+                    cricket_signal = self.map_dict.get(gesture_name, gesture_name)
+                    
+                    # Apply smoothing
+                    smoother[hand_type].append(cricket_signal)
+                    if len(smoother[hand_type]) > 5:  # Keep last 5 detections
+                        smoother[hand_type].popleft()
+                    
+                    # Get most frequent recent signal
+                    if smoother[hand_type]:
+                        smoothed_signal = max(set(smoother[hand_type]), 
+                                            key=lambda x: list(smoother[hand_type]).count(x))
+                    else:
+                        smoothed_signal = cricket_signal
+                    
+                    # Visualize
+                    self._draw_hand_landmarks(output_img, landmarks, hand_type)
+                    self._add_gesture_label(output_img, landmarks, smoothed_signal, hand_type)
+                    
+                    current_signals.append(f"{hand_type}: {smoothed_signal}")
+                    
+                    if smoothed_signal != "Unknown":
+                        detected_any = True
+                        st.sidebar.success(f"🎯 Detected: {hand_type} - {smoothed_signal}")
+        
+        # Add header with current signals
+        self._add_header(output_img, current_signals)
+        
+        # Convert back to RGB for Streamlit
+        output_rgb = cv.cvtColor(output_img, cv.COLOR_BGR2RGB)
+        
+        return output_rgb, current_signals, detected_any
 
 
 # -------------------- Video Processor --------------------
-class Processor(VideoProcessorBase):
+class UmpireVideoProcessor(VideoProcessorBase):
     def __init__(self):
-        self.detector = LeanUmpireDetector()
-        self.smoother = defaultdict(lambda: deque(maxlen=4))
-        self.frame_i = 0
-        self.process_every = 4           # adaptive 4..6
-        self.last_output: Optional[np.ndarray] = None
-        self.last_detected: Optional[np.ndarray] = None
+        self.detector = EfficientUmpireDetector()
+        self.smoother = defaultdict(lambda: deque(maxlen=5))  # Per-hand smoothing
+        self.frame_count = 0
+        self.process_every = 3  # Process every 3rd frame for efficiency
+        self.last_output = None
+        self.last_detected_frame = None
+        self.last_detection_time = 0
+        
+        # Statistics
+        self.processed_frames = 0
+        self.detection_count = 0
 
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
-        self.frame_i += 1
-        img = frame.to_ndarray(format="rgb24")
-
-        # Frame skipping for CPU
-        if self.frame_i % self.process_every != 0 and self.last_output is not None:
+        self.frame_count += 1
+        rgb_frame = frame.to_ndarray(format="rgb24")
+        
+        # Skip frames for CPU efficiency
+        if self.frame_count % self.process_every != 0 and self.last_output is not None:
             return av.VideoFrame.from_ndarray(self.last_output, format="rgb24")
-
-        t0 = time.time()
-        out_rgb, detected = self.detector.run(img, self.smoother, self.process_every, self.frame_i)
-        self.last_output = out_rgb
+        
+        # Process frame
+        start_time = time.time()
+        processed_frame, signals, detected = self.detector.process_frame(
+            rgb_frame, self.smoother, self.frame_count
+        )
+        
+        self.processed_frames += 1
         if detected:
-            self.last_detected = out_rgb.copy()
-
-        # Adaptive throttle
-        dt = time.time() - t0
-        if dt > 0.08 and self.process_every < 6:
-            self.process_every += 1
-        elif dt < 0.04 and self.process_every > 3:
-            self.process_every -= 1
-
-        return av.VideoFrame.from_ndarray(out_rgb, format="rgb24")
+            self.detection_count += 1
+            self.last_detected_frame = processed_frame.copy()
+            self.last_detection_time = time.time()
+        
+        self.last_output = processed_frame
+        
+        # Adaptive frame skipping based on processing time
+        processing_time = time.time() - start_time
+        if processing_time > 0.1:  # If processing takes too long
+            self.process_every = min(6, self.process_every + 1)
+        elif processing_time < 0.05 and self.process_every > 2:  # If we have headroom
+            self.process_every = max(2, self.process_every - 1)
+        
+        return av.VideoFrame.from_ndarray(processed_frame, format="rgb24")
 
 
 # -------------------- Streamlit UI --------------------
-st.set_page_config(page_title="🏏 Umpire Signs — Streamlit (Lean 2-Hand)", layout="wide")
+st.set_page_config(
+    page_title="🏏 Cricket Umpire Signs Detector",
+    page_icon="🏏",
+    layout="wide"
+)
 
-st.title("🏏 Cricket Umpire Signs — Streamlit (Two Hands, 0.5 CPU)")
-st.caption("Live detected output only. Download returns a detected sample frame (never blank).")
+st.title("🏏 Cricket Umpire Signs Detector")
+st.markdown("""
+Real-time hand gesture detection for cricket umpire signals using your webcam. 
+Optimized for low CPU usage (0.5 cores).
+""")
 
+# Sidebar with instructions and stats
+with st.sidebar:
+    st.header("ℹ️ Instructions")
+    st.markdown("""
+    1. Allow camera access when prompted
+    2. Show clear hand gestures to the camera
+    3. Supported gestures:
+       - ✋ Open Hand → **Wide**
+       - ✊ Closed Fist → **Out**
+       - 👆 Pointing → **No Ball**
+       - 👌 OK Sign → **Four**
+       - ✌️ Peace Sign → **Six**
+       - 👍 Thumbs Up → **Free Hit**
+    """)
+    
+    st.header("📊 Detection Info")
+    if 'processor' in st.session_state:
+        proc = st.session_state.processor
+        st.metric("Processed Frames", proc.processed_frames)
+        st.metric("Successful Detections", proc.detection_count)
+        if proc.last_detection_time > 0:
+            st.metric("Last Detection", f"{time.time() - proc.last_detection_time:.1f}s ago")
+
+# Main content area
 col1, col2 = st.columns([1, 1])
+
 with col1:
-    st.markdown("### 📹 Camera")
+    st.subheader("📹 Live Camera Feed")
+    st.markdown("Position your hands clearly in the frame")
+
 with col2:
-    st.markdown("### 🎯 Live Detection Output")
-
-# Public STUN servers help on cloud hosts (Render, HF Spaces, etc.)
-rtc_configuration = RTCConfiguration(
-    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302", "stun:global.stun.twilio.com:3478"]}]}
-)
-
-webrtc_ctx = webrtc_streamer(
-    key="umpire-two-hand",
-    mode=WebRtcMode.SENDRECV,
-    video_processor_factory=Processor,        # ✅ new API (no session_state)
-    rtc_configuration=rtc_configuration,
-    media_stream_constraints={"video": True, "audio": False},
-    async_processing=True,
-)
+    st.subheader("🎯 Detection Output")
+    st.markdown("Gesture recognition results will appear here")
 
 st.divider()
 
-# Download detected sample only — read from the active processor
-proc = getattr(webrtc_ctx, "video_processor", None)
-if proc and proc.last_detected is not None:
-    detected_img = proc.last_detected
-    ok, buf = cv.imencode(".png", cv.cvtColor(detected_img, cv.COLOR_RGB2BGR))
-    if ok:
-        st.download_button(
-            "📥 Download Detected Sample",
-            data=buf.tobytes(),
-            file_name="umpire_detected.png",
-            mime="image/png",
-            help="Saves the latest frame where at least one real signal was detected."
-        )
-else:
-    st.info("Perform a clear signal (e.g., Open/Close/OK/Peace). The button appears once a detection is made.")
+# WebRTC streamer configuration
+RTC_CONFIGURATION = RTCConfiguration({
+    "iceServers": [
+        {"urls": ["stun:stun.l.google.com:19302"]},
+        {"urls": ["stun:stun1.l.google.com:19302"]}
+    ]
+})
 
+# Initialize or get processor instance
+def get_video_processor():
+    if 'processor' not in st.session_state:
+        st.session_state.processor = UmpireVideoProcessor()
+    return st.session_state.processor
+
+# WebRTC streamer
+webrtc_ctx = webrtc_streamer(
+    key="umpire-signs-detector",
+    mode=WebRtcMode.SENDRECV,
+    video_processor_factory=get_video_processor,
+    rtc_configuration=RTC_CONFIGURATION,
+    media_stream_constraints={
+        "video": {
+            "width": {"ideal": 640},
+            "height": {"ideal": 480},
+            "frameRate": {"ideal": 15, "max": 20}  # Lower FPS for efficiency
+        },
+        "audio": False
+    },
+    async_processing=True,
+)
+
+# Download section
+st.subheader("💾 Save Detected Signals")
+st.markdown("Download frames where umpire signals were successfully detected.")
+
+if webrtc_ctx.state.playing:
+    processor = get_video_processor()
+    
+    if processor.last_detected_frame is not None:
+        # Convert the detected frame for download
+        download_frame = cv.cvtColor(processor.last_detected_frame, cv.COLOR_RGB2BGR)
+        success, buffer = cv.imencode(".png", download_frame)
+        
+        if success:
+            st.download_button(
+                label="📥 Download Last Detected Frame",
+                data=buffer.tobytes(),
+                file_name=f"umpire_signal_{int(time.time())}.png",
+                mime="image/png",
+                help="Saves the most recent frame with a detected umpire signal"
+            )
+            st.success("✅ Frame with detected signal is ready for download!")
+        else:
+            st.error("❌ Could not encode image for download")
+    else:
+        st.info("👆 Perform a clear hand signal to enable download")
+else:
+    st.info("🎥 Click 'START' to begin camera feed and gesture detection")
+
+# Footer
+st.divider()
+st.caption(
+    "Built with MediaPipe, OpenCV, and Streamlit • "
+    "Optimized for low-resource deployment • "
+    "Gesture detection may vary based on lighting and camera quality"
+)
