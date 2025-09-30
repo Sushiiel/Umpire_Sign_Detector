@@ -1,5 +1,7 @@
-gradio==4.16.0
-opencv-python-headless
-mediapipe
-numpy
-tensorflow
+gradio==4.19.2
+gradio_client==0.10.1
+opencv-python-headless==4.10.0.84
+mediapipe==0.10.14
+numpy==1.24.3
+tensorflow==2.15.0
+protobuf==3.20.3
