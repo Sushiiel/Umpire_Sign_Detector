@@ -699,11 +699,11 @@
 Streamlit — Cricket Umpire Signs (Lean 2-Hand, 0.5 CPU)
 - Live webcam with minimal overlay
 - Two-hand detection (Left/Right)
-- Download button saves ONLY a detected frame
+- Download button saves ONLY a detected frame (never blank)
 """
 
 import os
-# ---- Hard cap CPU threads for tiny Render instances ----
+# ---- Hard cap CPU threads for tiny instances ----
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 os.environ['OMP_NUM_THREADS'] = '1'
@@ -724,7 +724,7 @@ import cv2 as cv
 import numpy as np
 import mediapipe as mp
 import streamlit as st
-from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, WebRtcMode
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, WebRtcMode, RTCConfiguration
 
 # import your classifier (ensure it uses 1 thread if TFLite)
 from model import KeyPointClassifier  # keep your existing module/folder
@@ -803,9 +803,8 @@ class LeanUmpireDetector:
     def run(self, frame_rgb: np.ndarray, smoother, process_every: int, frame_i: int):
         """
         Returns (output_rgb, detected_any)
-        - frame skipping, 320x240 resize, minimal draw
+        - 320x240 resize, minimal draw
         """
-        # Downscale for CPU
         img = frame_rgb
         ih, iw = img.shape[:2]
         if ih * iw > 320 * 240:
@@ -837,7 +836,7 @@ class LeanUmpireDetector:
 
                 # Smooth per-hand
                 smoother[hand_label].append(signal)
-                smoothed = max(set(smoother[hand_label]), key=smoother[hand_label].count)
+                smoothed = max(set(smoother[hand_label]), key=self.smoother_count)
 
                 self._draw_points(overlay, lms)
                 self._label(overlay, lms, f"{hand_label}: {smoothed}")
@@ -851,6 +850,11 @@ class LeanUmpireDetector:
         self._header(overlay, " | ".join(header))
         out_rgb = cv.cvtColor(overlay, cv.COLOR_BGR2RGB)
         return out_rgb, detected
+
+    @staticmethod
+    def smoother_count(iterable):
+        # small helper for max(..., key=...)
+        return list(iterable).count
 
 
 # -------------------- Video Processor --------------------
@@ -893,32 +897,34 @@ st.set_page_config(page_title="🏏 Umpire Signs — Streamlit (Lean 2-Hand)", l
 st.title("🏏 Cricket Umpire Signs — Streamlit (Two Hands, 0.5 CPU)")
 st.caption("Live detected output only. Download returns a detected sample frame (never blank).")
 
-# Initialize processor in session state
-if "processor" not in st.session_state:
-    st.session_state["processor"] = Processor()
-
 col1, col2 = st.columns([1, 1])
 with col1:
     st.markdown("### 📹 Camera")
 with col2:
     st.markdown("### 🎯 Live Detection Output")
 
+# Public STUN servers help on cloud hosts (Render, HF Spaces, etc.)
+rtc_configuration = RTCConfiguration(
+    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302", "stun:global.stun.twilio.com:3478"]}]}
+)
+
 webrtc_ctx = webrtc_streamer(
     key="umpire-two-hand",
     mode=WebRtcMode.SENDRECV,
-    video_processor_factory=Processor,   # ✅ new API
+    video_processor_factory=Processor,        # ✅ new API (no session_state)
+    rtc_configuration=rtc_configuration,
     media_stream_constraints={"video": True, "audio": False},
     async_processing=True,
 )
 
 st.divider()
 
-# Download detected sample only
-processor: Processor = st.session_state["processor"]
-detected_img = processor.last_detected
-if detected_img is not None:
-    success, buf = cv.imencode(".png", cv.cvtColor(detected_img, cv.COLOR_RGB2BGR))
-    if success:
+# Download detected sample only — read from the active processor
+proc = getattr(webrtc_ctx, "video_processor", None)
+if proc and proc.last_detected is not None:
+    detected_img = proc.last_detected
+    ok, buf = cv.imencode(".png", cv.cvtColor(detected_img, cv.COLOR_RGB2BGR))
+    if ok:
         st.download_button(
             "📥 Download Detected Sample",
             data=buf.tobytes(),
@@ -928,3 +934,4 @@ if detected_img is not None:
         )
 else:
     st.info("Perform a clear signal (e.g., Open/Close/OK/Peace). The button appears once a detection is made.")
+
