@@ -364,6 +364,8 @@
 
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
 """
 Cricket Umpire Signs Detector - Optimized for Real-time Detection
 """
@@ -789,12 +791,6 @@ def create_interface():
                     type="numpy",
                     mirror_webcam=False
                 )
-                status_box = gr.Textbox(
-                    label="Detection Status",
-                    value="Ready - Show umpire signals to start",
-                    interactive=False,
-                    lines=2
-                )
                 
                 with gr.Row():
                     show_samples_btn = gr.Button("📊 Show Captured Samples", variant="primary")
@@ -802,8 +798,14 @@ def create_interface():
             
             with gr.Column(scale=1):
                 output_display = gr.Image(
-                    label="🎯 Detection Output",
+                    label="🎯 Live Detection Output",
                     type="numpy"
+                )
+                status_box = gr.Textbox(
+                    label="Detection Status",
+                    value="Ready - Show umpire signals to start",
+                    interactive=False,
+                    lines=2
                 )
                 
                 gr.Markdown("""
